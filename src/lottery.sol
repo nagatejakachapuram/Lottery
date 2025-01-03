@@ -1,108 +1,150 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
-import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
-import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 
-contract Lottery is VRFConsumerBaseV2 {
-    address private owner;
-    uint256 constant TICKETPRICE = 0.1 ether;
-    mapping(address => uint256) public participantTickets;
-    address[] private participantList;
-    uint256 public totalTickets;
+pragma solidity 0.8.19;
 
-    VRFCoordinatorV2Interface private immutable vrfCoordinator;
-    bytes32 private immutable keyHash;
-    uint64 private immutable subscriptionId;
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-    uint256 private requestId;
-    uint256 private randomWord;
+/**
+ * @title A sample Raffle Contract
+ * @author Patrick Collins
+ * @notice This contract is for creating a sample raffle contract
+ * @dev This implements the Chainlink VRF Version 2
+ */
+contract Raffle is VRFConsumerBaseV2Plus {
+    /* Errors */
+    error Raffle__TransferFailed();
+    error Raffle__SendMoreToEnterRaffle();
+    error Raffle__RaffleNotOpen();
 
-    event TicketPurchased(address indexed buyer, uint256 ticketNumber);
-    event WinnerSelected(address indexed winner, uint256 prizeMoney);
-    event RandomNumberRequest(uint256 requestId);
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can call this function");
-        _;
+    /* Type declarations */
+    enum RaffleState {
+        OPEN,
+        CALCULATING
     }
 
-    modifier validTicketPurchase() {
-        require(msg.value == TICKETPRICE, "Please send exactly 0.1 ether");
-        _;
-    }
+    /* State variables */
+    // Chainlink VRF Variables
+    uint256 private immutable i_subscriptionId;
+    bytes32 private immutable i_gasLane;
+    uint32 private immutable i_callbackGasLimit;
+    uint16 private constant REQUEST_CONFIRMATIONS = 3;
+    uint32 private constant NUM_WORDS = 1;
 
+    // Lottery Variables
+    uint256 private immutable i_interval;
+    uint256 private immutable i_entranceFee;
+    uint256 private s_lastTimeStamp;
+    address private s_recentWinner;
+    address payable[] private s_players;
+    RaffleState private s_raffleState;
+
+    /* Events */
+    event RequestedRaffleWinner(uint256 indexed requestId);
+    event RaffleEnter(address indexed player);
+    event WinnerPicked(address indexed player);
+
+    /* Functions */
     constructor(
-        address _vrfCoordinator,
-        bytes32 _keyHash,
-        uint64 _subscriptionId
-    ) VRFConsumerBaseV2(_vrfCoordinator) {
-        require(
-            _vrfCoordinator != address(0),
-            "Invalid VRF Coordinator address"
-        );
-        require(_keyHash != bytes32(0), "Invalid key hash");
-        require(_subscriptionId > 0, "Invalid subscription ID");
-
-        owner = msg.sender;
-        vrfCoordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
-        keyHash = _keyHash;
-        subscriptionId = _subscriptionId;
+        uint256 subscriptionId,
+        bytes32 gasLane, // keyHash
+        uint256 interval,
+        uint256 entranceFee,
+        uint32 callbackGasLimit,
+        address vrfCoordinatorV2
+    ) VRFConsumerBaseV2Plus(vrfCoordinatorV2) {
+        i_gasLane = gasLane;
+        i_interval = interval;
+        i_subscriptionId = subscriptionId;
+        i_entranceFee = entranceFee;
+        s_raffleState = RaffleState.OPEN;
+        s_lastTimeStamp = block.timestamp;
+        i_callbackGasLimit = callbackGasLimit;
     }
 
-    function buyTicket() public payable validTicketPurchase {
-        require(
-            participantTickets[msg.sender] == 0,
-            "You already bought a ticket"
-        );
-
-        totalTickets++;
-        participantTickets[msg.sender] = totalTickets;
-        participantList.push(msg.sender);
-
-        emit TicketPurchased(msg.sender, totalTickets);
+    function enterRaffle() public payable {
+        if (msg.value < i_entranceFee) {
+            revert Raffle__SendMoreToEnterRaffle();
+        }
+        if (s_raffleState != RaffleState.OPEN) {
+            revert Raffle__RaffleNotOpen();
+        }
+        s_players.push(payable(msg.sender));
+        emit RaffleEnter(msg.sender);
     }
 
-    function getAllParticipants() public view returns (address[] memory) {
-        return participantList;
-    }
-
-    function requestRandomness() public onlyOwner {
-        require(participantList.length > 0, "No participants in the list");
-        requestId = vrfCoordinator.requestRandomWords(
-            keyHash,
-            subscriptionId,
-            3, // Confirmations
-            100000, // Callback gas limit
-            1 // Number of words
-        );
-        emit RandomNumberRequest(requestId);
+    function triggerRaffle() external {
+        if (
+            (block.timestamp - s_lastTimeStamp) > i_interval &&
+            s_raffleState == RaffleState.OPEN &&
+            address(this).balance > 0 &&
+            s_players.length > 0
+        ) {
+            s_raffleState = RaffleState.CALCULATING;
+            uint256 requestId = s_vrfCoordinator.requestRandomWords(
+                i_gasLane,
+                i_subscriptionId,
+                REQUEST_CONFIRMATIONS,
+                i_callbackGasLimit,
+                NUM_WORDS
+            );
+            emit RequestedRaffleWinner(requestId);
+        } else {
+            revert("Conditions for triggering raffle not met");
+        }
     }
 
     function fulfillRandomWords(
         uint256,
-        uint256[] memory randomWords
+        uint256[] calldata randomWords
     ) internal override {
-        randomWord = randomWords[0];
-        selectWinner();
+        uint256 indexOfWinner = randomWords[0] % s_players.length;
+        address payable recentWinner = s_players[indexOfWinner];
+        s_recentWinner = recentWinner;
+        s_players = new address payable[](0);
+        s_raffleState = RaffleState.OPEN;
+        s_lastTimeStamp = block.timestamp;
+        emit WinnerPicked(recentWinner);
+        (bool success, ) = recentWinner.call{value: address(this).balance}("");
+        if (!success) {
+            revert Raffle__TransferFailed();
+        }
     }
 
-    function selectWinner() private {
-        require(
-            address(this).balance >= totalTickets * TICKETPRICE,
-            "Insufficient funds for payout"
-        );
-        uint256 winnerIndex = randomWord % totalTickets;
-        address winnerAddress = participantList[winnerIndex];
-        uint256 prizeMoney = address(this).balance;
-
-        payable(winnerAddress).transfer(prizeMoney);
-        emit WinnerSelected(winnerAddress, prizeMoney);
-
-        resetLottery();
+    /* Getter Functions */
+    function getRaffleState() public view returns (RaffleState) {
+        return s_raffleState;
     }
 
-    function resetLottery() private {
-        delete participantList;
-        totalTickets = 0;
+    function getNumWords() public pure returns (uint256) {
+        return NUM_WORDS;
+    }
+
+    function getRequestConfirmations() public pure returns (uint256) {
+        return REQUEST_CONFIRMATIONS;
+    }
+
+    function getRecentWinner() public view returns (address) {
+        return s_recentWinner;
+    }
+
+    function getPlayer(uint256 index) public view returns (address) {
+        return s_players[index];
+    }
+
+    function getLastTimeStamp() public view returns (uint256) {
+        return s_lastTimeStamp;
+    }
+
+    function getInterval() public view returns (uint256) {
+        return i_interval;
+    }
+
+    function getEntranceFee() public view returns (uint256) {
+        return i_entranceFee;
+    }
+
+    function getNumberOfPlayers() public view returns (uint256) {
+        return s_players.length;
     }
 }
