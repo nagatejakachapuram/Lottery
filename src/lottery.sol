@@ -2,8 +2,8 @@
 
 pragma solidity 0.8.19;
 
-import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
-import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 
 /**
  * @title A sample Raffle Contract
@@ -11,8 +11,13 @@ import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/V
  * @notice This contract is for creating a sample raffle contract
  * @dev This implements the Chainlink VRF Version 2
  */
-contract Raffle is VRFConsumerBaseV2Plus {
+contract Raffle is VRFConsumerBaseV2 {
     /* Errors */
+    error Raffle__UpkeepNotNeeded(
+        uint256 currentBalance,
+        uint256 numPlayers,
+        uint256 raffleState
+    );
     error Raffle__TransferFailed();
     error Raffle__SendMoreToEnterRaffle();
     error Raffle__RaffleNotOpen();
@@ -25,7 +30,8 @@ contract Raffle is VRFConsumerBaseV2Plus {
 
     /* State variables */
     // Chainlink VRF Variables
-    uint256 private immutable i_subscriptionId;
+    VRFCoordinatorV2Interface private immutable i_vrfCoordinator;
+    uint64 private immutable i_subscriptionId;
     bytes32 private immutable i_gasLane;
     uint32 private immutable i_callbackGasLimit;
     uint16 private constant REQUEST_CONFIRMATIONS = 3;
@@ -46,13 +52,14 @@ contract Raffle is VRFConsumerBaseV2Plus {
 
     /* Functions */
     constructor(
-        uint256 subscriptionId,
-        bytes32 gasLane, // keyHash
+        uint64 subscriptionId,
+        bytes32 gasLane,
         uint256 interval,
         uint256 entranceFee,
         uint32 callbackGasLimit,
-        address vrfCoordinatorV2
-    ) VRFConsumerBaseV2Plus(vrfCoordinatorV2) {
+        address vrfCoordinator
+    ) VRFConsumerBaseV2(vrfCoordinator) {
+        i_vrfCoordinator = VRFCoordinatorV2Interface(vrfCoordinator);
         i_gasLane = gasLane;
         i_interval = interval;
         i_subscriptionId = subscriptionId;
@@ -73,30 +80,45 @@ contract Raffle is VRFConsumerBaseV2Plus {
         emit RaffleEnter(msg.sender);
     }
 
-    function triggerRaffle() external {
-        if (
-            (block.timestamp - s_lastTimeStamp) > i_interval &&
-            s_raffleState == RaffleState.OPEN &&
-            address(this).balance > 0 &&
-            s_players.length > 0
-        ) {
-            s_raffleState = RaffleState.CALCULATING;
-            uint256 requestId = s_vrfCoordinator.requestRandomWords(
-                i_gasLane,
-                i_subscriptionId,
-                REQUEST_CONFIRMATIONS,
-                i_callbackGasLimit,
-                NUM_WORDS
+    function checkUpkeep(
+        bytes memory /* checkData */
+    )
+        public
+        view
+        returns (bool upkeepNeeded, bytes memory /* performData */)
+    {
+        bool isOpen = RaffleState.OPEN == s_raffleState;
+        bool timePassed = ((block.timestamp - s_lastTimeStamp) > i_interval);
+        bool hasPlayers = s_players.length > 0;
+        bool hasBalance = address(this).balance > 0;
+        upkeepNeeded = (timePassed && isOpen && hasBalance && hasPlayers);
+        return (upkeepNeeded, "");
+    }
+
+    function performUpkeep(bytes calldata /* performData */) external {
+        (bool upkeepNeeded, ) = checkUpkeep("");
+        if (!upkeepNeeded) {
+            revert Raffle__UpkeepNotNeeded(
+                address(this).balance,
+                s_players.length,
+                uint256(s_raffleState)
             );
-            emit RequestedRaffleWinner(requestId);
-        } else {
-            revert("Conditions for triggering raffle not met");
         }
+
+        s_raffleState = RaffleState.CALCULATING;
+        uint256 requestId = i_vrfCoordinator.requestRandomWords(
+            i_gasLane,
+            i_subscriptionId,
+            REQUEST_CONFIRMATIONS,
+            i_callbackGasLimit,
+            NUM_WORDS
+        );
+        emit RequestedRaffleWinner(requestId);
     }
 
     function fulfillRandomWords(
-        uint256,
-        uint256[] calldata randomWords
+        uint256, /* requestId */
+        uint256[] memory randomWords
     ) internal override {
         uint256 indexOfWinner = randomWords[0] % s_players.length;
         address payable recentWinner = s_players[indexOfWinner];
